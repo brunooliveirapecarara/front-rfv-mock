@@ -1,0 +1,108 @@
+@import 'tailwindcss';
+@import '@fontsource-variable/montserrat';
+
+@theme {
+  --font-sans: 'Montserrat Variable', ui-sans-serif, system-ui, sans-serif;
+
+  --color-brand: #ffd53d;
+  --color-brand-strong: #f5c518;
+  --color-brand-soft: #fff3c2;
+  --color-sand: #f0efec;
+  --color-surface: #ffffff;
+  --color-ink: #333333;
+  --color-ink-muted: #6f6f6f;
+  --color-line: #e4e2dd;
+  --color-coral: #ff5a4f;
+  --color-coral-soft: #ffe3e0;
+  --color-teal: #1e7f86;
+  --color-teal-soft: #d9eef0;
+  --color-info: #3b6fb6;
+  --color-info-soft: #e1eaf6;
+  --color-teal-ink: #14585d;
+  --color-coral-ink: #b3261e;
+  --color-info-ink: #254b82;
+  --color-warning-ink: #7a5a00;
+
+  --radius-card: 2rem;
+  --shadow-card: 0 8px 24px rgb(0 0 0 / 0.06);
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    color: var(--color-ink);
+    background: var(--color-sand);
+  }
+  body {
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+  :focus-visible {
+    outline: 3px solid var(--color-brand-strong);
+    outline-offset: 2px;
+  }
+  button:not(:disabled),
+  [role='button'] {
+    cursor: pointer;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.15s ease;
+}
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+.pop-enter-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.pop-leave-active {
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.pop-enter-from,
+.pop-leave-to {
+  opacity: 0;
+  transform: translateY(8px) scale(0.98);
+}
+
+.toast-enter-active,
+.toast-leave-active {
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
+  transform: translateX(24px);
+}
+.toast-move {
+  transition: transform 0.2s ease;
+}
+
+.rise-in {
+  animation: rise-in 0.28s ease both;
+}
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+.drawer-enter-active,
+.drawer-leave-active {
+  transition: transform 0.22s ease;
+}
+.drawer-enter-from,
+.drawer-leave-to {
+  transform: translateX(-100%);
+}

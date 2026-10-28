@@ -1,0 +1,1279 @@
+// pr-data · base de dados da rede: DW (dimensões e fatos) e as origens de cada tabela. Esboço v2.1, 20/10/2026.
+// Cole em dbdiagram.io. MEDIDO = réplica pr-bko-read1 em 20/10/2026. ESTIMATIVA = a medir.
+// Nomes pelo ADR 2026-10-20-lingua-nomes-e-glossario-do-dw e pelo glossário (notas/Glossário do DW). Chaves pelo ADR 2026-10-20-chaves-do-dw.
+// Pares: esquema/mart-crm.dbml (o CRM como consumidor) e notas/Linhagem e origens do DW.md (fluxo e matriz de origens).
+
+Project pr_data {
+  database_type: 'PostgreSQL'
+  Note: '''
+  # pr-data · base de dados da rede (v2.1)
+  Instância dedicada, fora da produção. Tipos em PostgreSQL (hipótese da prova); o modelo não depende do motor.
+
+  **Camadas**
+  - raw_<origem>: pouso 1:1 das origens, só com as colunas listadas aqui (grupos cinza), com o fuso de cada origem declarado.
+  - dw: dimensões (azul), fatos (verde), perfis (roxo), configuração (amarelo).
+  - dw_pii: dado pessoal em claro, acesso restrito (vermelho).
+  - mart_<consumidor>: o que é de um consumidor só. Ver mart-crm.dbml.
+
+  **Chaves** (ADR 2026-10-20-chaves-do-dw)
+  - Toda tabela tem chave do DW; o id da origem nunca é a chave.
+  - Entidade ou fato de uma linha de origem: <nome>_id = '<origem>:<id>' (produto_id = bko_estoque:123; lote_id = pinoquio_collection_form:98765; venda_produto_id = bko_nf_produto:555).
+  - Nasce no DW: ULID (pessoa_id, uniao_pessoa_id). Catálogo: código de negócio (loja_id, marca_id, grupo_produto_id, categoria_id, tamanho_id). Perfil e retrato: chave composta do grão.
+  - O fato guarda a chave durável da entidade, nunca a de uma versão: unir pessoas ou dar história a uma dimensão não reprocessa fato.
+  - Chave de dimensão no fato nunca é nula: -1 / nao_identificado (a origem não diz quem) e -2 / nao_se_aplica (o papel não existe nesse fato).
+
+  **Regras de ligação**
+  - Fato aponta para dimensão. Dois processos se ligam pela dimensão compartilhada (dim_produto, dim_cadastro).
+  - A chave de outro processo entra como dimensão degenerada (lote_id na entrada, nf_id na venda): agrupa e cruza, sem tabela de dimensão. Para cruzar, cada lado é somado até o grão comum antes da junção.
+  - A única ligação entre dimensões é a classificação do produto (marca, grupo de produto, categoria, tamanho) e a do cadastro com a pessoa.
+  - Id vindo da origem (bko_*, pinoquio_*, pr_notify_*) só aparece na tabela cujo grão ele é, como coluna de linhagem sem linha: serve para rastrear e recarregar.
+
+  **Como ler as linhas**
+  - Cinza claro com nome grao_*: a tabela do DW herda o grão daquela origem.
+  - Cinza escuro: relações dentro das origens.
+  - Verde: fato para dimensão. Verde claro com nome dd_*: dimensão degenerada (chave de outro processo). Azul: classificação do produto e cadastro para pessoa.
+
+  **Fornecedor e cliente são papéis no fato** (cadastro_fornecedor_id, cadastro_cliente_id); o cadastro aponta para a pessoa.
+  '''
+}
+
+// =====================================================================
+// ENUMS
+// =====================================================================
+
+Enum dw.origem_cadastro {
+  bko_fornecedor [note: 'bko_prod.fornecedors: um cadastro por loja']
+  bko_cliente [note: 'bko_prod.clientes: um cadastro por documento']
+  app_usuario [note: 'app_mobile.users: conta no app do fornecedor']
+  central_contato [note: 'app_rel.contatos: chegou pela Central sem cadastro']
+  reservado [note: 'nao_identificado e nao_se_aplica']
+}
+
+Enum dw.tipo_pessoa {
+  PF
+  PJ
+  ND [note: 'sem documento válido']
+}
+
+Enum dw.status_pessoa {
+  ativa
+  unida [note: 'absorvida por outra pessoa; ver unida_a']
+}
+
+Enum dw.tipo_identificador {
+  cpf
+  cnpj
+  telefone [note: 'E.164']
+  email
+  bsuid [note: 'usuário no WhatsApp']
+}
+
+Enum dw.forca_vinculo {
+  documento [note: 'CPF/CNPJ com dígito válido: une pessoas']
+  contato [note: 'telefone ou e-mail: liga, não une']
+}
+
+Enum dw.escopo {
+  rede
+  loja
+}
+
+Enum dw.modalidade {
+  consignacao [note: 'tipo_aquisicao_id 1']
+  compra_pix [note: 'tipo_aquisicao_id 2']
+  compra_credito [note: 'tipo_aquisicao_id 3, Moedas PR']
+  compra_pj [note: 'prevista no código (4), sem linha na tabela']
+}
+
+Enum dw.reducao {
+  nenhuma [note: 'valor_reduzido 0']
+  reduzido [note: 'valor_reduzido 1']
+  em_processamento [note: 'valor_reduzido 2: lote de redução em andamento']
+}
+
+Enum dw.saida_produto {
+  em_estoque
+  vendido
+  devolvido_fornecedor
+  doado
+  cancelado
+  baixado [note: 'inventário, perda ou roubo']
+}
+
+Enum dw.tipo_nf_venda {
+  venda [note: 'nf_tipo_id 2']
+  troca [note: 'nf_tipo_id 3']
+  cancelamento [note: 'nf_tipo_id 5: abate o V']
+  devolucao_cliente [note: 'nf_tipo_id 6: abate o V']
+}
+
+Enum dw.desfecho_devolucao {
+  em_aberto
+  retirado
+  doado
+  cancelado
+}
+
+Enum dw.finalidade {
+  autenticacao
+  transacional
+  promocional
+  nao_informada [note: 'até o PN-01 existir na origem']
+}
+
+// =====================================================================
+// ORIGEM · BKO transacional (bko_prod, lido na réplica, pousa em raw_bko)
+// =====================================================================
+
+Table bko_prod.estoques [headercolor: #7F8C8D] {
+  id bigint [pk]
+  cod varchar(20)
+  fornecedor_id bigint
+  fornecedor_original_id bigint [note: 'fornecedor canônico = COALESCE(NULLIF(fornecedor_original_id, 0), fornecedor_id)']
+  fornecedor_id_atual bigint [note: 'cadastro de alocação: muda no remanejamento; é o que vai para a NF']
+  loja_id_origem bigint
+  loja_id_atual bigint
+  estoque_status_id bigint
+  estoque_marca_id bigint
+  estoque_grupo_id bigint
+  estoque_categoria_id bigint
+  estoque_categoria_sub_id bigint
+  tamanho_id bigint [note: 'estoque_grupo_tamanhos.id']
+  estoque_cor_id bigint
+  estoque_conservacao_id bigint
+  tipo_aquisicao_id bigint [note: 'nunca nulo']
+  is_valid tinyint [note: 'regra única de produto vendável (rotina de utilitários)']
+  qtde_inicial int
+  qtde int
+  valor_venda double
+  valor_venda_original double [note: 'zero quando nunca reduzido']
+  valor_fornecedor double
+  valor_fornecedor_original double
+  bonificacao_fornecedor double
+  valor_reduzido tinyint [note: '0, 1 ou 2 (não é booleano)']
+  dt_reducao datetime
+  smart_discount tinyint
+  smart_discount_venda double
+  smart_discount_fornecedor double
+  nf_produto_id_saida bigint
+  pinoquio_id bigint [note: 'collection_parts.id, ~99% preenchido em set-out/2026']
+  created_at timestamp [note: 'régua do fornecimento; horário de Brasília sem fuso']
+  updated_at timestamp [note: 'sem índice; não muda na comunicação da devolução']
+
+  Note: '~23 M linhas, 63 GB. 12 meses: 4,40 M produtos sem contas técnicas (MEDIDO). dt_liberacao_estoque e estoque_devolucao_id quase não são gravados no fluxo atual: não usar.'
+}
+
+Table bko_prod.nfs [headercolor: #7F8C8D] {
+  id bigint [pk]
+  loja_id bigint
+  nf_tipo_id bigint
+  nf_cliente_id bigint [note: 'clientes.id desde 20/10/2024 12h (corte por data_venda_atu); antes, nf_clientes; 1 = cliente padrão']
+  data_venda datetime
+  data_venda_atu datetime
+  valor_bruto double
+  valor_desconto double
+  valor_liquido double
+  updated_at timestamp
+
+  Note: '12 meses, tipos 2 e 3: 1,50 M NFs (MEDIDO). Cliente padrão em 36,8% das NFs recentes de venda e troca.'
+}
+
+Table bko_prod.nf_produtos [headercolor: #7F8C8D] {
+  id bigint [pk]
+  nf_id bigint
+  estoque_id bigint
+  fornecedor_id bigint [note: 'fornecedor ATUAL do produto: nunca usar como papel']
+  item_qtde decimal(20,6) [note: 'negativa no item devolvido da troca']
+  valor_bruto decimal(20,6)
+  valor_desconto decimal(20,6) [note: 'gravado negativo']
+  valor_liquido decimal(20,6) [note: 'soma fecha com nfs.valor_liquido em 99,9% das NFs']
+  valor_fornecedor decimal(20,6) [note: 'total da linha, não unitário']
+
+  Note: '~34 M linhas; metade das recentes é de NF de entrada e de devolução: o fato filtra pelo tipo.'
+}
+
+Table bko_prod.fornecedors [headercolor: #7F8C8D] {
+  id bigint [pk]
+  loja_id bigint
+  cpf_cnpj varchar(25)
+  razao_social varchar(255)
+  celular varchar(25)
+  telefone varchar(25)
+  email varchar(150)
+  dt_nascimento date
+  sexo varchar(1)
+  end_uf varchar(2)
+  interno smallint
+  compra_fisica tinyint
+  blacklist smallint
+  smart_discount tinyint [note: 'aceita desconto inteligente']
+  created_at timestamp
+  updated_at timestamp
+
+  Note: '~762 mil cadastros. 12 meses: 202 mil ativos = 180 mil pessoas (MEDIDO).'
+}
+
+Table bko_prod.fornecedor_contratos [headercolor: #7F8C8D] {
+  id bigint [pk]
+  fornecedor_id bigint
+  versao varchar(191) [note: 'versão 2 ou mais: prazo de retirada de 30 dias; antes, 60']
+  status_id int [note: '1 vigente, 2 expirado, 3 aguardando assinatura, 4 aguardando envio']
+  reducao_dias int
+  reducao_percentual decimal(10,2)
+  created_at timestamp
+  expired_at timestamp
+}
+
+Table bko_prod.clientes [headercolor: #7F8C8D] {
+  id bigint [pk]
+  nome varchar(255)
+  cpf_cnpj varchar(25) [unique]
+  telefone varchar(15)
+  email varchar(150)
+  dt_nascimento date
+  sexo varchar(1)
+  end_uf varchar(2)
+  created_at timestamp
+  updated_at timestamp
+
+  Note: '~793 mil. O BKO cria um cadastro aqui para todo fornecedor ao cadastrar produto: por isso contém 99,99% dos fornecedores. Cadastro, não papel.'
+}
+
+Table bko_prod.lojas [headercolor: #7F8C8D] {
+  id bigint [pk]
+  sigla_loja varchar(10)
+  nome_fantasia varchar(150)
+  end_cidade varchar(100)
+  uf_id bigint
+  grupo_id bigint [note: 'grupo do franqueado']
+  cpf_cnpj varchar(25)
+  data_inauguracao date
+  is_disabled tinyint
+  status_id bigint
+  status_operacional_id bigint
+  is_compra_pf_consignacao_activated tinyint
+  is_compra_pf_pix_activated tinyint
+  is_compra_pf_credito_activated tinyint
+  compra_pf_pix_fornecedor_id bigint [note: 'cadastro técnico da loja']
+  compra_pf_credito_fornecedor_id bigint [note: 'cadastro técnico da loja']
+  compra_pj_lojas_pr_fornecedor_id bigint [note: 'cadastro técnico da loja']
+  percentual_etiqueta double [note: 'sobre o valor de etiqueta, pouco usado']
+  percentual_etiqueta_novo double [note: 'sobre o valor de etiqueta, novo com etiqueta']
+  aliquota_operacional double
+  markup double
+  smart_discount tinyint [note: 'loja aderiu ao desconto inteligente']
+  is_cashback_activated tinyint
+  mgm_is_active tinyint [note: 'indicação']
+}
+
+Table bko_prod.estoque_devolucaos [headercolor: #7F8C8D] {
+  id bigint [pk]
+  loja_id bigint
+  estoque_id bigint [note: 'a ligação certa com o produto']
+  status_id smallint [note: 'estoque_devolucao_statuses']
+  notified_at date [note: 'comunicação ao fornecedor']
+  created_at timestamp [note: 'separação']
+  updated_at timestamp
+
+  Note: 'Devolução por não venda (produto parado 180+ dias). ~2,4 M linhas.'
+}
+
+Table bko_prod.donations [headercolor: #7F8C8D] {
+  id bigint [pk]
+  estoque_id bigint
+  fornecedor_id bigint
+  loja_id bigint
+  type varchar(16) [note: 'automatic, anticipated, spontaneous']
+  origin varchar(8) [note: 'app, api, web, email']
+  created_at timestamp
+}
+
+// =====================================================================
+// ORIGEM · BKO catálogos (pequenos, recarregados inteiros)
+// =====================================================================
+
+Table bko_prod.estoque_marcas [headercolor: #95A5A6] {
+  id bigint [pk]
+  nome varchar(150)
+  Note: '17 mil marcas, ~490 duplicatas; ids genéricos somam ~45% dos produtos (MEDIDO).'
+}
+
+Table bko_prod.estoque_marca_tiers [headercolor: #95A5A6] {
+  estoque_marca_id bigint [pk]
+  tier varchar(16)
+}
+
+Table bko_prod.estoque_classes [headercolor: #95A5A6] {
+  id bigint [pk]
+  "desc" varchar(150)
+}
+
+Table bko_prod.estoque_grupos [headercolor: #95A5A6] {
+  id bigint [pk]
+  estoque_classe_id bigint
+  "desc" varchar(150)
+}
+
+Table bko_prod.estoque_categorias [headercolor: #95A5A6] {
+  id bigint [pk]
+  "desc" varchar(150)
+}
+
+Table bko_prod.estoque_categoria_subs [headercolor: #95A5A6] {
+  id bigint [pk]
+  produto_categoria_id bigint
+  "desc" varchar(150)
+}
+
+Table bko_prod.estoque_grupo_tamanhos [headercolor: #95A5A6] {
+  id bigint [pk]
+  estoque_grupo_id bigint
+  "desc" varchar(25)
+  Note: '432 tamanhos, por grupo de produto.'
+}
+
+Table bko_prod.estoque_cors [headercolor: #95A5A6] {
+  id bigint [pk]
+  "desc" varchar(50)
+}
+
+Table bko_prod.estoque_conservacaos [headercolor: #95A5A6] {
+  id bigint [pk]
+  "desc" varchar(50)
+}
+
+Table bko_prod.estoque_aquisicao_tipo [headercolor: #95A5A6] {
+  id bigint [pk]
+  name varchar(50)
+  Note: '1 Consignação, 2 Compra Pix, 3 Compra Crédito (Moedas PR).'
+}
+
+Table bko_prod.estoque_statuses [headercolor: #95A5A6] {
+  id bigint [pk]
+  descricao varchar(25)
+  Note: '20 status; 13 = cancelado, 20 = baixa.'
+}
+
+Table bko_prod.nf_tipos [headercolor: #95A5A6] {
+  id bigint [pk]
+  cod varchar(10)
+  name varchar(50)
+}
+
+Table bko_prod.ufs [headercolor: #95A5A6] {
+  id bigint [pk]
+  cod char(2)
+  uf_regiao_id bigint
+}
+
+Table bko_prod.loja_grupos [headercolor: #95A5A6] {
+  id bigint [pk]
+  nome varchar(150)
+  loja_master_id bigint
+}
+
+Table bko_prod.loja_clusters [headercolor: #95A5A6] {
+  id bigint [pk]
+  nome varchar(255)
+  Note: 'Vazia em 20/10/2026.'
+}
+
+Table bko_prod.loja_cluster_lojas [headercolor: #95A5A6] {
+  loja_cluster_id bigint
+  loja_id bigint
+  Note: 'Vazia em 20/10/2026.'
+}
+
+// =====================================================================
+// ORIGEM · Pinóquio (lote), pousa em raw_pinoquio
+// =====================================================================
+
+Table pinoquio.collection_form [headercolor: #7F8C8D] {
+  id bigint [pk, note: 'número do lote (R-<id>)']
+  fornecedor_id bigint
+  store_id bigint
+  qty_total smallint
+  acquisition_type_choosed smallint
+  signed_at datetime
+  registration_part_start_at datetime
+  registration_part_end_at datetime
+  products_approved_by_fornecedor_at datetime
+  label_generated_at timestamp [note: 'etiquetado: vale como liberação do produto']
+  step_id varchar(255)
+  status_id varchar(255)
+  deleted_at timestamp
+  updated_at timestamp
+
+  Note: 'Lote (romaneio, captação). Desde abr/2025; obrigatório desde abr/2026. ~454 mil linhas.'
+}
+
+Table pinoquio.collection_parts [headercolor: #7F8C8D] {
+  id bigint [pk]
+  collection_form_id bigint
+  qty int
+  status varchar(255)
+  external_estoque_id bigint [note: 'estoques.id; preenchido desde o início em todas as peças finalizadas']
+}
+
+Table pinoquio.collection_form_devolution [headercolor: #7F8C8D] {
+  id bigint [pk]
+  collection_form_id bigint
+  qnt_total int [note: 'recusados na triagem']
+  status_id varchar(255)
+  deleted_at timestamp
+}
+
+// =====================================================================
+// ORIGEM · app, carteira, pr-notify e aplicação de relacionamento
+// =====================================================================
+
+Table app_mobile.users [headercolor: #7F8C8D] {
+  id bigint [pk]
+  cpf_cnpj varchar(14)
+  cellphone varchar(11)
+  email varchar(100)
+  created_at timestamp
+  disabled_at timestamp
+
+  Note: 'App do fornecedor. ~282 mil contas; 66,5% dos fornecedores ativos têm conta (MEDIDO).'
+}
+
+Table wallet.client_balances [headercolor: #7F8C8D] {
+  id bigint [pk]
+  document varchar(30)
+  store_id bigint
+  type varchar(50) [note: 'MOEDAS_PR ou CASHBACK']
+  total_cents bigint
+  updated_at timestamp [note: 'UTC']
+}
+
+Table pr_notify.notifications [headercolor: #7F8C8D] {
+  id bigint [pk]
+  idempotency_key varchar(255)
+  channel varchar(255)
+  template varchar(255)
+  source varchar(255) [note: 'bko-phoenix, pinoquio-api, wallet-api']
+  audience_type varchar(255) [note: 'só customer (carteira) ou nulo']
+  audience_id varchar(255) [note: 'TEXTO; em customer é o documento do cliente: dado pessoal, só como hash']
+  store_id bigint
+  status varchar(255)
+  provider varchar(255)
+  attempts int
+  sent_at timestamp
+  delivered_at timestamp
+  created_at timestamp
+  updated_at timestamp
+
+  Note: '~1,87 M linhas desde 01/07/2026, 6,7 KB por linha (MEDIDO). Não se extraem contact nem variables.'
+}
+
+Table pr_notify.consents [headercolor: #BDC3C7] {
+  id bigint [pk]
+  person_id char(26)
+  channel varchar(16)
+  purpose varchar(16)
+  status varchar(16)
+  source varchar(32)
+  occurred_at datetime
+
+  Note: 'A CRIAR no pr-notify (PN-05). Livro de consentimentos, só acréscimo.'
+}
+
+Table app_rel.contatos [headercolor: #BDC3C7] {
+  id bigint [pk]
+  telefone_e164 varchar(20)
+  bsuid varchar(64)
+  nome_informado varchar(150)
+  loja_id bigint
+  criado_em timestamp
+
+  Note: 'A CRIAR na aplicação de relacionamento: quem escreveu na Central sem cadastro.'
+}
+
+// =====================================================================
+// DW · DIMENSÕES
+// =====================================================================
+
+Table dw.dim_data [headercolor: #2E86C1] {
+  data date [pk]
+  ano smallint
+  mes smallint
+  ano_mes char(7)
+  semana_iso char(8)
+  dia_semana smallint [note: '1 = segunda']
+  fim_de_semana boolean
+  feriado_nacional boolean [note: '← dw.cfg_feriado']
+
+  Note: 'Gerada (2015 a 2035).'
+}
+
+Table dw.dim_loja [headercolor: #2E86C1] {
+  loja_id bigint [pk, note: '← lojas.id (código de negócio)']
+  sigla varchar(10) [note: '← lojas.sigla_loja']
+  nome varchar(150) [note: '← lojas.nome_fantasia']
+  cidade varchar(100) [note: '← lojas.end_cidade']
+  uf char(2) [note: '← ufs.cod']
+  regiao varchar(20) [note: '← ufs.uf_regiao_id']
+  grupo_franqueado_id bigint [note: '← lojas.grupo_id']
+  grupo_franqueado varchar(150) [note: '← loja_grupos.nome']
+  master boolean [note: '← loja_grupos.loja_master_id = loja']
+  propria boolean [note: 'grupo 1 (a confirmar, P-12)']
+  cluster_id bigint [note: '← loja_cluster_lojas (vazia hoje, P-13)']
+  cluster varchar(255)
+  data_inauguracao date [note: '← lojas.data_inauguracao']
+  safra smallint
+  ativa boolean [note: '← lojas.is_disabled, status_id']
+  status_operacional varchar(32) [note: '← lojas.status_operacional_id']
+  tecnica boolean [note: 'lojas 0, 1 e 26']
+  aceita_consignacao boolean
+  aceita_compra_pix boolean
+  aceita_compra_credito boolean
+  percentual_etiqueta_usado numeric(6,2) [note: '← lojas.percentual_etiqueta']
+  percentual_etiqueta_novo numeric(6,2) [note: '← lojas.percentual_etiqueta_novo']
+  aliquota_operacional numeric(8,4)
+  markup numeric(8,4)
+  desconto_inteligente_ativo boolean [note: '← lojas.smart_discount']
+  cashback_ativo boolean [note: '← lojas.is_cashback_activated']
+  indicacao_ativa boolean [note: '← lojas.mgm_is_active']
+
+  Note: 'Grão: loja. Tipo 1; se a história das configurações importar, tipo 2 (P-23).'
+}
+
+Table dw.dim_pessoa [headercolor: #2E86C1] {
+  pessoa_id char(26) [pk, note: 'ULID estável do grafo; não é o documento']
+  tipo dw.tipo_pessoa [not null]
+  status dw.status_pessoa [not null]
+  unida_a char(26) [note: 'se unida: a pessoa sobrevivente']
+  uf char(2) [note: '← end_uf do cadastro mais recente']
+  faixa_etaria varchar(8) [note: '← dt_nascimento; a data fica em dw_pii']
+  genero_declarado varchar(1) [note: '← sexo']
+  primeira_vez_em date
+  construida_em timestamptz [not null]
+
+  Note: 'Grão: pessoa. Grafo derivado dos cadastros; reconstruído toda noite preservando o pessoa_id. Membro reservado 00000000000000000000000000 (não identificada): dono dos cadastros reservados, fora dos perfis. ~0,8 a 0,9 M (ESTIMATIVA).'
+}
+
+Table dw.dim_cadastro [headercolor: #2E86C1] {
+  cadastro_id varchar(64) [pk, note: 'origem:id legível, ex. bko_fornecedor:4521; reservados nao_identificado e nao_se_aplica']
+  origem dw.origem_cadastro [not null]
+  origem_id bigint [note: '← fornecedors.id, clientes.id, users.id ou contatos.id; nulo nos reservados']
+  pessoa_id char(26) [not null]
+  loja_id bigint [note: '← fornecedors.loja_id ou contatos.loja_id']
+  criado_em timestamptz
+  tecnico boolean [not null, default: false]
+  motivo_tecnico varchar(32) [note: 'interno, compra_pj, conta_compra_pf, nome_de_loja, documento_da_loja, manual, reservado']
+  bloqueado boolean [note: '← fornecedors.blacklist']
+  aceita_desconto_inteligente boolean [note: '← fornecedors.smart_discount']
+  contrato_versao varchar(16) [note: '← fornecedor_contratos vigente']
+  contrato_reducao_dias int
+  contrato_reducao_percentual numeric(6,2)
+
+  Indexes {
+    (origem, origem_id) [unique, name: 'ux_cadastro_origem']
+    pessoa_id [name: 'ix_cadastro_pessoa']
+  }
+
+  Note: '''
+  Grão: cadastro de origem. NÃO é tabela de fornecedor nem de cliente: é o registro onde a pessoa aparece. O papel está no fato.
+  Unir ou separar pessoas muda só pessoa_id aqui, nunca o fato.
+  Reservados: nao_identificado (venda ao cliente padrão, mensagem sem audiência) e nao_se_aplica, técnicos e da pessoa reservada. O cliente padrão (clientes.id 1, nf_clientes.id 1) não entra como cadastro.
+  Cadastro técnico ← fornecedors.interno, compra_fisica, razao_social (padrão de loja), lojas.cpf_cnpj, lojas.compra_*_fornecedor_id, dw.cfg_cadastro_tecnico. Fica nos fatos e sai das leituras de pessoa.
+  ~1,8 M (ESTIMATIVA).
+  '''
+}
+
+Table dw.dim_identificador [headercolor: #2E86C1] {
+  pessoa_id char(26) [not null]
+  tipo dw.tipo_identificador [not null]
+  chave_hmac char(64) [not null, note: 'HMAC-SHA256 do valor normalizado']
+  forca dw.forca_vinculo [not null]
+  doc_valido boolean
+  cadastro_id varchar(64) [note: 'de qual cadastro veio']
+  visto_primeiro_em timestamptz
+  visto_ultimo_em timestamptz
+
+  Indexes {
+    (tipo, chave_hmac, pessoa_id) [pk]
+    pessoa_id [name: 'ix_identificador_pessoa']
+  }
+
+  Note: 'Grão: pessoa x identificador. É como a Central reconhece quem escreve sem guardar o número em claro. Documento válido une; dois documentos válidos diferentes nunca se unem; telefone e e-mail ligam.'
+}
+
+Table dw.dim_produto [headercolor: #2E86C1] {
+  produto_id varchar(64) [pk, note: 'origem:id legível, ex. bko_estoque:123']
+  bko_estoque_id bigint [not null, unique, note: '← estoques.id']
+  cod varchar(20) [note: '← estoques.cod']
+  pinoquio_collection_part_id bigint [note: '← estoques.pinoquio_id']
+  marca_id bigint [note: '← estoques.estoque_marca_id']
+  grupo_produto_id bigint [note: '← estoques.estoque_grupo_id']
+  categoria_id bigint [note: '← estoques.estoque_categoria_id']
+  subcategoria varchar(150) [note: '← estoque_categoria_subs.desc']
+  tamanho_id bigint [note: '← estoques.tamanho_id']
+  cor varchar(50) [note: '← estoque_cors.desc']
+  conservacao varchar(50) [note: '← estoque_conservacaos.desc; grupo "pouco usado" x "novo com etiqueta"']
+  modalidade dw.modalidade [not null, note: '← estoques.tipo_aquisicao_id']
+  vendavel boolean [not null, note: '← estoques.is_valid, qtde_inicial < 500, loja fora de 0, 1, 26']
+  qtde_inicial int
+  qtde_atual int [note: '← estoques.qtde']
+  valor_venda numeric(12,2) [note: '← estoques.valor_venda (preço atual na loja)']
+  valor_venda_original numeric(12,2) [note: '← estoques.valor_venda_original (antes da redução; nulo quando zero)']
+  valor_fornecedor numeric(12,2) [note: '← estoques.valor_fornecedor']
+  valor_fornecedor_original numeric(12,2) [note: '← estoques.valor_fornecedor_original']
+  bonificacao_percentual numeric(8,4) [note: '← estoques.bonificacao_fornecedor']
+  valor_fornecedor_final numeric(12,2) [note: 'valor_fornecedor x (1 + bonificação/100)']
+  reducao dw.reducao [not null, note: '← estoques.valor_reduzido']
+  reduzido_em timestamptz [note: '← estoques.dt_reducao']
+  desconto_inteligente boolean [note: '← estoques.smart_discount: redução vinda de desconto no caixa']
+  loja_atual_id bigint [note: '← estoques.loja_id_atual']
+  cadastro_fornecedor_atual_id varchar(64) [note: '← estoques.fornecedor_id_atual; técnico, nunca papel']
+  status_origem smallint [note: '← estoques.estoque_status_id']
+  saida dw.saida_produto [not null, note: '← status e datas abaixo']
+  liberado_em timestamptz [note: '← collection_form.label_generated_at (etiquetado)']
+  vendido_em timestamptz [note: '← nfs.data_venda por nf_produto_id_saida']
+  devolvido_em timestamptz [note: '← fato_devolucao_fornecedor (a mais recente não cancelada)']
+  doado_em timestamptz [note: '← donations.created_at']
+  tipo_doacao varchar(16) [note: '← donations.type']
+  atualizado_na_origem_em timestamptz [note: '← estoques.updated_at']
+  carregado_em timestamptz [not null]
+
+  Indexes {
+    (marca_id) [name: 'ix_produto_marca']
+    (grupo_produto_id, categoria_id) [name: 'ix_produto_grupo']
+    (loja_atual_id, saida) [name: 'ix_produto_loja_saida']
+  }
+
+  Note: '''
+  Grão: produto (uma linha de estoques). O que o produto é e a situação atual dele (tipo 1).
+  Quem forneceu, onde e em que lote entrou ficam em fato_entrada_produto; as vendas em fato_venda_produto.
+  Carga: ids novos + reprocesso dos produtos tocados por nf_produtos, estoque_devolucaos.updated_at, estoques_reducoes_produtos e estoque_txs (updated_at não basta e não tem índice).
+  ~4,4 M por ano (MEDIDO: 4,40 M em 12 meses).
+  '''
+}
+
+Table dw.dim_marca [headercolor: #2E86C1] {
+  marca_id bigint [pk, note: '← estoque_marcas.id']
+  nome_original varchar(150)
+  marca_canonica_id bigint [note: '← cfg_marca_excecao; ausente = ela mesma; 0 = sem marca']
+  marca_canonica varchar(150)
+  generica boolean [note: 'ids 1, 4943, 11926, 3499, 4998, 4774']
+  tier varchar(16) [note: '← estoque_marca_tiers.tier']
+
+  Note: 'A canonicalização mora aqui: mudar a lista de exceções reconstrói a dimensão, sem reprocessar fato.'
+}
+
+Table dw.dim_grupo_produto [headercolor: #2E86C1] {
+  grupo_produto_id bigint [pk, note: '← estoque_grupos.id']
+  grupo varchar(150) [note: '← estoque_grupos.desc']
+  classe_id bigint [note: '← estoque_grupos.estoque_classe_id']
+  classe varchar(150) [note: '← estoque_classes.desc (departamento)']
+
+  Note: 'Grupo de produto: não confundir com grupo do franqueado.'
+}
+
+Table dw.dim_categoria [headercolor: #2E86C1] {
+  categoria_id bigint [pk, note: '← estoque_categorias.id']
+  categoria varchar(150) [note: '← estoque_categorias.desc']
+}
+
+Table dw.dim_tamanho [headercolor: #2E86C1] {
+  tamanho_id bigint [pk, note: '← estoque_grupo_tamanhos.id']
+  tamanho varchar(25) [note: '← estoque_grupo_tamanhos.desc']
+  grupo_produto_id bigint [note: '← estoque_grupo_tamanhos.estoque_grupo_id']
+}
+
+// =====================================================================
+// DW · CONFIGURAÇÃO (arquivos versionados no repositório do pipeline)
+// =====================================================================
+
+Table dw.cfg_marca_excecao [headercolor: #D4AC0D] {
+  marca_id bigint [pk]
+  marca_canonica_id bigint [not null, note: '0 = sem marca']
+  motivo varchar(16) [not null, note: 'generica ou alias']
+  atualizado_por varchar(64)
+  atualizado_em date
+}
+
+Table dw.cfg_cadastro_tecnico [headercolor: #D4AC0D] {
+  bko_fornecedor_id bigint [pk]
+  motivo varchar(32) [not null]
+  incluido_por varchar(64) [not null]
+  incluido_em date [not null]
+
+  Note: 'Lista manual; as regras automáticas estão no código do pipeline.'
+}
+
+Table dw.cfg_feriado [headercolor: #D4AC0D] {
+  data date [pk]
+  nome varchar(100)
+  abrangencia varchar(16)
+}
+
+Table dw.cfg_template_finalidade [headercolor: #D4AC0D] {
+  template varchar(100) [pk]
+  finalidade dw.finalidade [not null]
+  atualizado_por varchar(64)
+  atualizado_em date
+
+  Note: 'De-para de template para finalidade até o PN-01 gravar a finalidade na origem.'
+}
+
+// =====================================================================
+// DW · FATOS (só apontam para dimensões)
+// =====================================================================
+
+Table dw.fato_entrada_produto [headercolor: #239B56] {
+  produto_id varchar(64) [pk, note: 'uma entrada por produto: a chave do fato é a do produto']
+  bko_estoque_id bigint [not null, note: '← estoques.id (id de origem)']
+  data_cadastro date [not null, note: '← estoques.created_at']
+  cadastrado_em timestamptz [not null]
+  loja_id bigint [not null, note: 'loja de origem ← estoques.loja_id_origem']
+  cadastro_fornecedor_id varchar(64) [not null, note: 'PAPEL FORNECEDOR ← fornecedor canônico de estoques']
+  modalidade dw.modalidade [not null]
+  lote_id varchar(64) [note: 'DIMENSÃO DEGENERADA → fato_lote ← collection_parts.collection_form_id; nulo quando o produto entrou sem lote']
+  qtde_inicial int
+  valor_venda_cadastro numeric(12,2) [note: 'valor de venda no cadastro: valor_venda_original se houve redução, senão valor_venda']
+  valor_fornecedor_cadastro numeric(12,2)
+  carregado_em timestamptz [not null]
+
+  Indexes {
+    (data_cadastro, loja_id) [name: 'ix_entrada_data_loja']
+    (cadastro_fornecedor_id, data_cadastro) [name: 'ix_entrada_fornecedor']
+    lote_id [name: 'ix_entrada_lote']
+  }
+
+  Note: '''
+  Grão: produto cadastrado no estoque, vindo de um fornecedor. Só acréscimo.
+  Fornecimento = soma das entradas por pessoa, loja e dia. Compra Pix e crédito contam (decisão de 20/10/2026).
+  ~4,4 M por ano (MEDIDO).
+  '''
+}
+
+Table dw.fato_venda_produto [headercolor: #239B56] {
+  venda_produto_id varchar(64) [pk, note: 'bko_nf_produto:<id>']
+  bko_nf_produto_id bigint [not null, unique, note: '← nf_produtos.id (linhagem)']
+  nf_id varchar(64) [not null, note: 'DIMENSÃO DEGENERADA: a NF (bko_nf:<id>) ← nf_produtos.nf_id; agrupa os itens da mesma venda']
+  data_venda date [not null, note: '← nfs.data_venda']
+  vendido_em timestamptz
+  tipo_nf dw.tipo_nf_venda [not null, note: '← nfs.nf_tipo_id 2, 3, 5, 6']
+  item_devolvido boolean [not null, default: false, note: 'quantidade negativa na troca']
+  loja_venda_id bigint [not null, note: '← nfs.loja_id']
+  loja_origem_id bigint [not null, note: '← estoques.loja_id_origem: o V vai para esta (decisão de 20/10/2026)']
+  produto_id varchar(64) [not null, note: '← nf_produtos.estoque_id']
+  cadastro_fornecedor_id varchar(64) [not null, note: 'PAPEL FORNECEDOR ← fornecedor canônico de estoques, nunca nf_produtos.fornecedor_id']
+  cadastro_cliente_id varchar(64) [not null, note: 'PAPEL CLIENTE ← nfs.nf_cliente_id; nao_identificado no cliente padrão']
+  qtde numeric(12,3) [note: '← nf_produtos.item_qtde']
+  valor_bruto numeric(12,2) [note: '← nf_produtos.valor_bruto']
+  valor_desconto numeric(12,2) [note: 'desconto do caixa, positivo ← -nf_produtos.valor_desconto, sem a parte do desconto inteligente']
+  valor_desconto_inteligente numeric(12,2) [note: 'parte do desconto que é redução de preço (decisão de 20/10/2026)']
+  valor_liquido numeric(12,2) [note: '← nf_produtos.valor_liquido: base do V e do gasto do cliente']
+  valor_fornecedor numeric(12,2) [note: '← nf_produtos.valor_fornecedor (total da linha)']
+  dias_ate_venda int [note: 'data_venda - data de cadastro do produto']
+  carregado_em timestamptz [not null]
+
+  Indexes {
+    (data_venda, loja_venda_id) [name: 'ix_venda_data_loja']
+    (cadastro_fornecedor_id, data_venda) [name: 'ix_venda_fornecedor']
+    (cadastro_cliente_id, data_venda) [name: 'ix_venda_cliente']
+    produto_id [name: 'ix_venda_produto']
+    nf_id [name: 'ix_venda_nf']
+  }
+
+  Note: '''
+  Grão: produto numa NF de venda, troca, cancelamento ou devolução do cliente. Um fato, dois papéis de pessoa.
+  Troca, cancelamento e devolução do cliente abatem o V (decisão de 20/10/2026; se complexo demais, ficam de fora com a diferença documentada).
+  ~3,3 M por ano (MEDIDO: 278 mil itens em set/2026). 65% com cliente identificado.
+  '''
+}
+
+Table dw.fato_devolucao_fornecedor [headercolor: #239B56] {
+  devolucao_fornecedor_id varchar(64) [pk, note: 'bko_estoque_devolucao:<id>']
+  bko_estoque_devolucao_id bigint [not null, unique, note: '← estoque_devolucaos.id (linhagem)']
+  produto_id varchar(64) [not null, note: '← estoque_devolucaos.estoque_id']
+  loja_id bigint [not null]
+  cadastro_fornecedor_id varchar(64) [not null]
+  data_separacao date [not null, note: '← estoque_devolucaos.created_at']
+  separado_em timestamptz
+  comunicado_em date [note: '← estoque_devolucaos.notified_at']
+  prazo_retirada_dias smallint [note: '30 (contrato versão 2 ou mais) ou 60']
+  vence_em date
+  desfecho dw.desfecho_devolucao [not null, note: '← status_id e donations']
+  desfecho_em timestamptz
+  status_origem smallint
+  carregado_em timestamptz [not null]
+
+  Indexes {
+    (cadastro_fornecedor_id, data_separacao) [name: 'ix_devolucao_fornecedor']
+    produto_id [name: 'ix_devolucao_produto']
+  }
+
+  Note: 'Grão: separação de um produto para voltar ao fornecedor (devolução por não venda). Não é a devolução do cliente nem a recusa na triagem.'
+}
+
+Table dw.fato_lote [headercolor: #239B56] {
+  lote_id varchar(64) [pk, note: 'pinoquio_collection_form:<id>']
+  pinoquio_collection_form_id bigint [not null, unique, note: '← collection_form.id (linhagem; o número R-<id> do lote)']
+  data_assinatura date [note: '← collection_form.signed_at']
+  loja_id bigint [not null, note: '← collection_form.store_id']
+  cadastro_fornecedor_id varchar(64) [not null, note: '← collection_form.fornecedor_id']
+  modalidade dw.modalidade [note: '← acquisition_type_choosed']
+  assinado_em timestamptz [note: 'entrega']
+  triagem_iniciada_em timestamptz [note: '← registration_part_start_at']
+  triagem_concluida_em timestamptz [note: '← registration_part_end_at']
+  aprovado_fornecedor_em timestamptz [note: '← products_approved_by_fornecedor_at']
+  etiquetado_em timestamptz [note: '← label_generated_at']
+  qtd_declarada int [note: '← qty_total']
+  qtd_aceita int [note: '← SUM(collection_parts.qty)']
+  qtd_recusada int [note: '← collection_form_devolution.qnt_total']
+  etapa varchar(32) [note: '← step_id']
+  status varchar(32) [note: '← status_id']
+  aberto boolean [note: 'nem etiquetado nem cancelado']
+  horas_ate_etiqueta numeric(10,1)
+  carregado_em timestamptz [not null]
+
+  Indexes {
+    (loja_id, data_assinatura) [name: 'ix_lote_loja']
+    (cadastro_fornecedor_id, data_assinatura) [name: 'ix_lote_fornecedor']
+  }
+
+  Note: 'Grão: lote (romaneio). Fato acumulado: uma linha por lote, atualizada a cada marco; funil, fila e vazão da triagem. A entrada de cada produto guarda lote_id como dimensão degenerada; as quantidades do lote se somam no grão do lote, nunca depois de juntar com os produtos. ~0,4 M por ano.'
+}
+
+Table dw.fato_mensagem [headercolor: #239B56] {
+  mensagem_id varchar(64) [pk, note: 'pr_notify_notification:<id>']
+  pr_notify_notification_id bigint [not null, unique, note: '← notifications.id (linhagem)']
+  chave_idempotencia varchar(255) [not null, note: '← notifications.idempotency_key']
+  data date [not null]
+  criada_em timestamptz
+  loja_id bigint [not null, note: '← notifications.store_id; -2 (não se aplica) quando a mensagem não é de uma loja']
+  cadastro_id varchar(64) [not null, note: 'resolvido pelo hash do documento da audiência; nao_identificado sem audiência ou sem cadastro achado']
+  canal varchar(16) [note: 'sms, email, push, whatsapp']
+  template varchar(100)
+  finalidade dw.finalidade [note: '← cfg_template_finalidade até o PN-01']
+  sistema_origem varchar(32) [note: '← notifications.source']
+  status varchar(16)
+  provedor varchar(32)
+  tentativas smallint
+  enviada_em timestamptz
+  entregue_em timestamptz
+  custo numeric(10,4) [note: 'WhatsApp, quando a Central existir']
+  carregado_em timestamptz [not null]
+
+  Indexes {
+    (cadastro_id, data) [name: 'ix_mensagem_cadastro']
+    (data, loja_id) [name: 'ix_mensagem_data_loja']
+    chave_idempotencia [name: 'ix_mensagem_chave']
+  }
+
+  Note: 'Grão: pedido de envio por canal. Sem contato, variáveis nem documento: audience_id só vira hash na carga. ~6,4 M por ano (MEDIDO).'
+}
+
+Table dw.fato_uniao_pessoa [headercolor: #239B56] {
+  uniao_pessoa_id char(26) [pk, note: 'ULID: o evento nasce no DW']
+  evento varchar(10) [not null, note: 'uniao ou separacao']
+  pessoa_sobrevivente_id char(26) [not null]
+  outra_pessoa_id char(26) [not null]
+  regra varchar(32) [not null]
+  motivo varchar(255)
+  decidido_por varchar(64) [not null]
+  ocorrido_em timestamptz [not null]
+
+  Note: 'Só acréscimo. Explica por que um histórico mudou de pessoa.'
+}
+
+// =====================================================================
+// DW · PERFIS (derivados dos fatos, sem regra de programa)
+// =====================================================================
+
+Table dw.perfil_pessoa [headercolor: #7D3C98] {
+  pessoa_id char(26) [not null]
+  escopo dw.escopo [not null]
+  loja_id bigint [not null, note: 'loja: a loja; rede: loja de referência']
+  data_ref date [not null]
+  primeiro_fornecimento date [note: '← fato_entrada_produto']
+  ultimo_fornecimento date
+  fornecimento_anterior date
+  dias_desde_ultimo_fornecimento int [note: 'R']
+  dias_com_fornecimento_12m smallint [note: 'F']
+  valor_vendido_12m numeric(14,2) [note: 'V ← fato_venda_produto.valor_liquido no papel fornecedor, pela loja de origem, com abatimentos']
+  valor_fornecedor_12m numeric(14,2)
+  meses_com_fornecimento_12m smallint [note: 'recorrente = 6+']
+  produtos_fornecidos_12m int
+  dias_com_fornecimento_12m_ant smallint
+  valor_vendido_12m_ant numeric(14,2)
+  produtos_maduros int [note: 'denominador do sell-through']
+  produtos_maduros_vendidos_90d int [note: 'numerador; a razão só na leitura']
+  intervalo_medio_dias smallint
+  produtos_premium_12m int [note: '← dim_marca.tier']
+  grupo_produto_principal_id bigint
+  modalidade_principal dw.modalidade
+  lotes_12m smallint [note: '← fato_lote']
+  produtos_recusados_12m int [note: '← fato_lote']
+  devolucoes_12m int [note: '← fato_devolucao_fornecedor']
+  primeira_compra date [note: '← fato_venda_produto no papel cliente']
+  ultima_compra date
+  dias_com_compra_12m smallint
+  valor_comprado_12m numeric(14,2)
+  produtos_comprados_12m int
+  tem_app boolean [note: '← dim_cadastro (app_usuario)']
+  saldo_moedas_pr numeric(12,2) [note: '← wallet.client_balances MOEDAS_PR']
+  saldo_cashback numeric(12,2) [note: '← wallet.client_balances CASHBACK']
+  tem_telefone boolean [note: '← dim_identificador']
+  contato_transacional varchar(16) [note: '← pr_notify.consents (PN-05)']
+  contato_promocional varchar(16) [note: '← pr_notify.consents (PN-05)']
+  ultima_mensagem_em timestamptz [note: '← fato_mensagem']
+  mensagens_promocionais_90d smallint
+  forneceu_12m boolean
+  comprou_12m boolean
+  calculado_em timestamptz [not null]
+
+  Indexes {
+    (pessoa_id, escopo, loja_id) [pk]
+    (escopo, loja_id) [name: 'ix_perfil_loja']
+  }
+
+  Note: 'Grão: pessoa x escopo x loja. Características da pessoa, sem regra de programa. Universo: forneceu ou comprou identificado em 36 meses. Reconstruída toda noite. ~1 a 1,5 M (ESTIMATIVA).'
+}
+
+Table dw.perfil_pessoa_mensal [headercolor: #7D3C98] {
+  mes_fim date [not null]
+  pessoa_id char(26) [not null]
+  escopo dw.escopo [not null]
+  loja_id bigint [not null]
+  dias_desde_ultimo_fornecimento int
+  dias_com_fornecimento_12m smallint
+  valor_vendido_12m numeric(14,2)
+  valor_fornecedor_12m numeric(14,2)
+  dias_com_compra_12m smallint
+  valor_comprado_12m numeric(14,2)
+  forneceu_12m boolean
+  comprou_12m boolean
+  novo_rede boolean
+  novo_loja boolean
+  reativado boolean
+
+  Indexes {
+    (mes_fim, escopo, loja_id, pessoa_id) [pk]
+    (pessoa_id, mes_fim) [name: 'ix_perfil_mensal_pessoa']
+  }
+
+  Note: 'Retrato de fim de mês, só de quem forneceu ou comprou em 12 meses. Reconstruível para trás. ~6 a 8 M por ano (ESTIMATIVA).'
+}
+
+// =====================================================================
+// DW_PII · dado pessoal em claro (acesso restrito)
+// =====================================================================
+
+Table dw_pii.pessoa_contato [headercolor: #B03A2E] {
+  pessoa_id char(26) [pk]
+  nome varchar(255) [note: '← clientes.nome ou fornecedors.razao_social (cadastro mais recente)']
+  documento varchar(14) [note: '← cpf_cnpj normalizado']
+  telefone_e164 varchar(20)
+  email varchar(150)
+  data_nascimento date
+  cadastro_fonte_id varchar(64) [note: 'de qual cadastro veio o valor preferido']
+  atualizado_em timestamptz
+
+  Note: 'Acesso: pipeline e aplicação de relacionamento. Nunca BI, LLM nem consultor.'
+}
+
+// =====================================================================
+// FUTURO · mostrado para fixar o encaixe; não se constrói antes de ter consumidor
+// =====================================================================
+
+Table dw.fato_estoque_mensal [headercolor: #ABB2B9] {
+  mes date [not null]
+  produto_id varchar(64) [not null]
+  loja_id bigint [not null]
+  qtde int
+  Note: 'Painel e consultor. ← estoque_snapshots (~40 M linhas).'
+}
+
+Table dw.fato_reducao_preco [headercolor: #ABB2B9] {
+  reducao_preco_id varchar(64) [pk, note: 'origem:id; duas origens: redução no estoque e desconto inteligente na venda']
+  produto_id varchar(64) [not null]
+  reduzido_em timestamptz [not null]
+  percentual numeric(6,2)
+  desconto_inteligente boolean
+  Note: 'Histórico de reduções. ← estoques_reducoes_produtos e desconto inteligente.'
+}
+
+Table dw.fato_remanejamento [headercolor: #ABB2B9] {
+  remanejamento_id varchar(64) [pk, note: 'bko_estoque_remanejamento:<id>']
+  produto_id varchar(64) [not null]
+  data date [not null]
+  loja_origem_id bigint
+  loja_destino_id bigint
+  Note: '← estoque_remanejamentos.'
+}
+
+Table dw.fato_movimento_fornecedor [headercolor: #ABB2B9] {
+  movimento_fornecedor_id varchar(64) [pk, note: 'bko_movimento:<id>']
+  bko_movimento_id bigint [not null, unique]
+  cadastro_fornecedor_id varchar(64)
+  data date
+  tipo varchar(32)
+  valor numeric(12,2)
+  Note: 'Saldo do fornecedor (liberado e bloqueado). ← movimentos (a view da réplica é só esqueleto).'
+}
+
+Table dw.fato_conversa [headercolor: #ABB2B9] {
+  conversa_id varchar(64) [pk, note: 'origem:id da aplicação de relacionamento']
+  cadastro_id varchar(64)
+  loja_id bigint
+  aberta_em timestamptz
+  primeira_resposta_em timestamptz
+  encerrada_em timestamptz
+  Note: 'Quando a Central existir. ← aplicação de relacionamento.'
+}
+
+Table dw.fato_indicacao [headercolor: #ABB2B9] {
+  indicacao_id varchar(64) [pk, note: 'app_mgm_referral:<id>']
+  app_mgm_referral_id bigint [not null, unique]
+  cadastro_id varchar(64)
+  data date
+  Note: 'Indicação (MGM). ← app_mobile.mgm_referrals.'
+}
+
+Table dw.fato_resposta_nps [headercolor: #ABB2B9] {
+  resposta_nps_id varchar(64) [pk, note: 'app_nps_answer:<id>']
+  app_nps_answer_id bigint [not null, unique]
+  cadastro_id varchar(64)
+  data date
+  nota smallint
+  Note: '← app_mobile.nps_answers.'
+}
+
+Table dw.dim_produto_vetor [headercolor: #ABB2B9] {
+  produto_id varchar(64) [not null]
+  modelo varchar(64) [not null]
+  vetor vector(768)
+  gerado_em timestamptz
+
+  Indexes {
+    (produto_id, modelo) [pk]
+  }
+
+  Note: 'Recomendação, preço, busca. ← fotos e descrição do produto.'
+}
+
+// =====================================================================
+// LINHAGEM DE GRÃO · a tabela do DW herda o grão desta origem
+// =====================================================================
+
+Ref grao_produto: dw.dim_produto.bko_estoque_id - bko_prod.estoques.id [color: #ABB2B9]
+Ref grao_entrada: dw.fato_entrada_produto.bko_estoque_id - bko_prod.estoques.id [color: #ABB2B9]
+Ref grao_venda: dw.fato_venda_produto.bko_nf_produto_id - bko_prod.nf_produtos.id [color: #ABB2B9]
+Ref grao_devolucao: dw.fato_devolucao_fornecedor.bko_estoque_devolucao_id - bko_prod.estoque_devolucaos.id [color: #ABB2B9]
+Ref grao_lote: dw.fato_lote.pinoquio_collection_form_id - pinoquio.collection_form.id [color: #ABB2B9]
+Ref grao_mensagem: dw.fato_mensagem.pr_notify_notification_id - pr_notify.notifications.id [color: #ABB2B9]
+Ref grao_loja: dw.dim_loja.loja_id - bko_prod.lojas.id [color: #ABB2B9]
+Ref grao_marca: dw.dim_marca.marca_id - bko_prod.estoque_marcas.id [color: #ABB2B9]
+Ref grao_grupo_produto: dw.dim_grupo_produto.grupo_produto_id - bko_prod.estoque_grupos.id [color: #ABB2B9]
+Ref grao_categoria: dw.dim_categoria.categoria_id - bko_prod.estoque_categorias.id [color: #ABB2B9]
+Ref grao_tamanho: dw.dim_tamanho.tamanho_id - bko_prod.estoque_grupo_tamanhos.id [color: #ABB2B9]
+Ref grao_cadastro_fornecedor: dw.dim_cadastro.origem_id > bko_prod.fornecedors.id [color: #ABB2B9]
+Ref grao_cadastro_cliente: dw.dim_cadastro.origem_id > bko_prod.clientes.id [color: #ABB2B9]
+Ref grao_cadastro_app: dw.dim_cadastro.origem_id > app_mobile.users.id [color: #ABB2B9]
+Ref grao_cadastro_central: dw.dim_cadastro.origem_id > app_rel.contatos.id [color: #ABB2B9]
+
+// =====================================================================
+// RELAÇÕES NAS ORIGENS
+// =====================================================================
+
+Ref: bko_prod.estoques.fornecedor_id > bko_prod.fornecedors.id [color: #7F8C8D]
+Ref: bko_prod.estoques.loja_id_origem > bko_prod.lojas.id [color: #7F8C8D]
+Ref: bko_prod.estoques.estoque_marca_id > bko_prod.estoque_marcas.id [color: #7F8C8D]
+Ref: bko_prod.estoques.estoque_grupo_id > bko_prod.estoque_grupos.id [color: #7F8C8D]
+Ref: bko_prod.estoques.estoque_categoria_id > bko_prod.estoque_categorias.id [color: #7F8C8D]
+Ref: bko_prod.estoques.estoque_categoria_sub_id > bko_prod.estoque_categoria_subs.id [color: #7F8C8D]
+Ref: bko_prod.estoques.tamanho_id > bko_prod.estoque_grupo_tamanhos.id [color: #7F8C8D]
+Ref: bko_prod.estoques.estoque_cor_id > bko_prod.estoque_cors.id [color: #7F8C8D]
+Ref: bko_prod.estoques.estoque_conservacao_id > bko_prod.estoque_conservacaos.id [color: #7F8C8D]
+Ref: bko_prod.estoques.tipo_aquisicao_id > bko_prod.estoque_aquisicao_tipo.id [color: #7F8C8D]
+Ref: bko_prod.estoques.estoque_status_id > bko_prod.estoque_statuses.id [color: #7F8C8D]
+Ref: bko_prod.estoques.nf_produto_id_saida - bko_prod.nf_produtos.id [color: #7F8C8D]
+Ref: bko_prod.nf_produtos.nf_id > bko_prod.nfs.id [color: #7F8C8D]
+Ref: bko_prod.nf_produtos.estoque_id > bko_prod.estoques.id [color: #7F8C8D]
+Ref: bko_prod.nfs.nf_cliente_id > bko_prod.clientes.id [color: #7F8C8D]
+Ref: bko_prod.nfs.loja_id > bko_prod.lojas.id [color: #7F8C8D]
+Ref: bko_prod.nfs.nf_tipo_id > bko_prod.nf_tipos.id [color: #7F8C8D]
+Ref: bko_prod.fornecedors.loja_id > bko_prod.lojas.id [color: #7F8C8D]
+Ref: bko_prod.fornecedor_contratos.fornecedor_id > bko_prod.fornecedors.id [color: #7F8C8D]
+Ref: bko_prod.lojas.grupo_id > bko_prod.loja_grupos.id [color: #7F8C8D]
+Ref: bko_prod.lojas.uf_id > bko_prod.ufs.id [color: #7F8C8D]
+Ref: bko_prod.loja_cluster_lojas.loja_id > bko_prod.lojas.id [color: #7F8C8D]
+Ref: bko_prod.loja_cluster_lojas.loja_cluster_id > bko_prod.loja_clusters.id [color: #7F8C8D]
+Ref: bko_prod.estoque_marca_tiers.estoque_marca_id - bko_prod.estoque_marcas.id [color: #7F8C8D]
+Ref: bko_prod.estoque_grupos.estoque_classe_id > bko_prod.estoque_classes.id [color: #7F8C8D]
+Ref: bko_prod.estoque_categoria_subs.produto_categoria_id > bko_prod.estoque_categorias.id [color: #7F8C8D]
+Ref: bko_prod.estoque_grupo_tamanhos.estoque_grupo_id > bko_prod.estoque_grupos.id [color: #7F8C8D]
+Ref: bko_prod.estoque_devolucaos.estoque_id > bko_prod.estoques.id [color: #7F8C8D]
+Ref: bko_prod.donations.estoque_id > bko_prod.estoques.id [color: #7F8C8D]
+Ref: pinoquio.collection_form.fornecedor_id > bko_prod.fornecedors.id [color: #7F8C8D]
+Ref: pinoquio.collection_parts.collection_form_id > pinoquio.collection_form.id [color: #7F8C8D]
+Ref: pinoquio.collection_parts.external_estoque_id - bko_prod.estoques.id [color: #7F8C8D]
+Ref: pinoquio.collection_form_devolution.collection_form_id > pinoquio.collection_form.id [color: #7F8C8D]
+
+// =====================================================================
+// CHAVES DENTRO DO DW
+// =====================================================================
+
+Ref: dw.dim_cadastro.pessoa_id > dw.dim_pessoa.pessoa_id [color: #2E86C1]
+Ref: dw.dim_pessoa.unida_a > dw.dim_pessoa.pessoa_id [color: #2E86C1]
+Ref: dw.dim_identificador.pessoa_id > dw.dim_pessoa.pessoa_id [color: #2E86C1]
+Ref: dw.dim_identificador.cadastro_id > dw.dim_cadastro.cadastro_id [color: #2E86C1]
+Ref: dw.dim_produto.marca_id > dw.dim_marca.marca_id [color: #2E86C1]
+Ref: dw.dim_produto.grupo_produto_id > dw.dim_grupo_produto.grupo_produto_id [color: #2E86C1]
+Ref: dw.dim_produto.categoria_id > dw.dim_categoria.categoria_id [color: #2E86C1]
+Ref: dw.dim_produto.tamanho_id > dw.dim_tamanho.tamanho_id [color: #2E86C1]
+Ref: dw.cfg_marca_excecao.marca_id - dw.dim_marca.marca_id [color: #D4AC0D]
+Ref: dw.cfg_feriado.data - dw.dim_data.data [color: #D4AC0D]
+
+Ref: dw.fato_entrada_produto.produto_id - dw.dim_produto.produto_id [color: #239B56]
+Ref: dw.fato_entrada_produto.data_cadastro > dw.dim_data.data [color: #239B56]
+Ref: dw.fato_entrada_produto.loja_id > dw.dim_loja.loja_id [color: #239B56]
+Ref: dw.fato_entrada_produto.cadastro_fornecedor_id > dw.dim_cadastro.cadastro_id [color: #239B56]
+Ref dd_lote: dw.fato_entrada_produto.lote_id > dw.fato_lote.lote_id [color: #82E0AA]
+
+Ref: dw.fato_venda_produto.produto_id > dw.dim_produto.produto_id [color: #239B56]
+Ref: dw.fato_venda_produto.data_venda > dw.dim_data.data [color: #239B56]
+Ref: dw.fato_venda_produto.loja_venda_id > dw.dim_loja.loja_id [color: #239B56]
+Ref: dw.fato_venda_produto.loja_origem_id > dw.dim_loja.loja_id [color: #239B56]
+Ref: dw.fato_venda_produto.cadastro_fornecedor_id > dw.dim_cadastro.cadastro_id [color: #239B56]
+Ref: dw.fato_venda_produto.cadastro_cliente_id > dw.dim_cadastro.cadastro_id [color: #239B56]
+
+Ref: dw.fato_devolucao_fornecedor.produto_id > dw.dim_produto.produto_id [color: #239B56]
+Ref: dw.fato_devolucao_fornecedor.data_separacao > dw.dim_data.data [color: #239B56]
+Ref: dw.fato_devolucao_fornecedor.loja_id > dw.dim_loja.loja_id [color: #239B56]
+Ref: dw.fato_devolucao_fornecedor.cadastro_fornecedor_id > dw.dim_cadastro.cadastro_id [color: #239B56]
+
+Ref: dw.fato_lote.data_assinatura > dw.dim_data.data [color: #239B56]
+Ref: dw.fato_lote.loja_id > dw.dim_loja.loja_id [color: #239B56]
+Ref: dw.fato_lote.cadastro_fornecedor_id > dw.dim_cadastro.cadastro_id [color: #239B56]
+
+Ref: dw.fato_mensagem.data > dw.dim_data.data [color: #239B56]
+Ref: dw.fato_mensagem.loja_id > dw.dim_loja.loja_id [color: #239B56]
+Ref: dw.fato_mensagem.cadastro_id > dw.dim_cadastro.cadastro_id [color: #239B56]
+
+Ref: dw.fato_uniao_pessoa.pessoa_sobrevivente_id > dw.dim_pessoa.pessoa_id [color: #239B56]
+Ref: dw.fato_uniao_pessoa.outra_pessoa_id > dw.dim_pessoa.pessoa_id [color: #239B56]
+
+Ref: dw.perfil_pessoa.pessoa_id > dw.dim_pessoa.pessoa_id [color: #7D3C98]
+Ref: dw.perfil_pessoa.loja_id > dw.dim_loja.loja_id [color: #7D3C98]
+Ref: dw.perfil_pessoa_mensal.pessoa_id > dw.dim_pessoa.pessoa_id [color: #7D3C98]
+Ref: dw_pii.pessoa_contato.pessoa_id - dw.dim_pessoa.pessoa_id [color: #B03A2E]
+
+Ref: dw.fato_estoque_mensal.produto_id > dw.dim_produto.produto_id [color: #ABB2B9]
+Ref: dw.fato_reducao_preco.produto_id > dw.dim_produto.produto_id [color: #ABB2B9]
+Ref: dw.fato_remanejamento.produto_id > dw.dim_produto.produto_id [color: #ABB2B9]
+Ref: dw.fato_movimento_fornecedor.cadastro_fornecedor_id > dw.dim_cadastro.cadastro_id [color: #ABB2B9]
+Ref: dw.fato_conversa.cadastro_id > dw.dim_cadastro.cadastro_id [color: #ABB2B9]
+Ref: dw.fato_indicacao.cadastro_id > dw.dim_cadastro.cadastro_id [color: #ABB2B9]
+Ref: dw.fato_resposta_nps.cadastro_id > dw.dim_cadastro.cadastro_id [color: #ABB2B9]
+Ref: dw.dim_produto_vetor.produto_id > dw.dim_produto.produto_id [color: #ABB2B9]
+
+// =====================================================================
+// GRUPOS
+// =====================================================================
+
+TableGroup origem_bko [color: #7F8C8D] {
+  bko_prod.estoques
+  bko_prod.nfs
+  bko_prod.nf_produtos
+  bko_prod.fornecedors
+  bko_prod.fornecedor_contratos
+  bko_prod.clientes
+  bko_prod.lojas
+  bko_prod.estoque_devolucaos
+  bko_prod.donations
+  Note: 'Origem: BKO (MariaDB), lido na réplica; horário de Brasília sem fuso. Pousa em raw_bko.'
+}
+
+TableGroup origem_bko_catalogos [color: #95A5A6] {
+  bko_prod.estoque_marcas
+  bko_prod.estoque_marca_tiers
+  bko_prod.estoque_classes
+  bko_prod.estoque_grupos
+  bko_prod.estoque_categorias
+  bko_prod.estoque_categoria_subs
+  bko_prod.estoque_grupo_tamanhos
+  bko_prod.estoque_cors
+  bko_prod.estoque_conservacaos
+  bko_prod.estoque_aquisicao_tipo
+  bko_prod.estoque_statuses
+  bko_prod.nf_tipos
+  bko_prod.ufs
+  bko_prod.loja_grupos
+  bko_prod.loja_clusters
+  bko_prod.loja_cluster_lojas
+  Note: 'Catálogos pequenos, recarregados inteiros toda noite.'
+}
+
+TableGroup origem_pinoquio [color: #7F8C8D] {
+  pinoquio.collection_form
+  pinoquio.collection_parts
+  pinoquio.collection_form_devolution
+  Note: 'Origem: Pinóquio (lote). Pousa em raw_pinoquio.'
+}
+
+TableGroup origem_outros [color: #7F8C8D] {
+  app_mobile.users
+  wallet.client_balances
+  pr_notify.notifications
+  pr_notify.consents
+  app_rel.contatos
+  Note: 'App, carteira (UTC), pr-notify e a aplicação de relacionamento. Cinza claro: a criar.'
+}
+
+TableGroup dw_dimensoes [color: #2E86C1] {
+  dw.dim_data
+  dw.dim_loja
+  dw.dim_pessoa
+  dw.dim_cadastro
+  dw.dim_identificador
+  dw.dim_produto
+  dw.dim_marca
+  dw.dim_grupo_produto
+  dw.dim_categoria
+  dw.dim_tamanho
+  Note: 'Dimensões conformadas: as mesmas para todo consumidor. Cada uma tem os membros reservados -1 / nao_identificado e -2 / nao_se_aplica (pessoa: 000…0).'
+}
+
+TableGroup dw_configuracao [color: #D4AC0D] {
+  dw.cfg_marca_excecao
+  dw.cfg_cadastro_tecnico
+  dw.cfg_feriado
+  dw.cfg_template_finalidade
+}
+
+TableGroup dw_fatos [color: #239B56] {
+  dw.fato_entrada_produto
+  dw.fato_venda_produto
+  dw.fato_devolucao_fornecedor
+  dw.fato_lote
+  dw.fato_mensagem
+  dw.fato_uniao_pessoa
+  Note: 'Fatos no grão da origem, com chave do DW e o id de origem como linhagem. Apontam para dimensões; a chave de outro processo entra como dimensão degenerada.'
+}
+
+TableGroup dw_perfis [color: #7D3C98] {
+  dw.perfil_pessoa
+  dw.perfil_pessoa_mensal
+}
+
+TableGroup dw_pii [color: #B03A2E] {
+  dw_pii.pessoa_contato
+}
+
+TableGroup dw_futuro [color: #ABB2B9] {
+  dw.fato_estoque_mensal
+  dw.fato_reducao_preco
+  dw.fato_remanejamento
+  dw.fato_movimento_fornecedor
+  dw.fato_conversa
+  dw.fato_indicacao
+  dw.fato_resposta_nps
+  dw.dim_produto_vetor
+  Note: 'Mostrado para fixar o encaixe. Não se constrói antes de ter consumidor.'
+}
